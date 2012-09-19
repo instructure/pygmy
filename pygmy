@@ -78,6 +78,7 @@ class Pygmy
     @config = {:schema => 'public'}.merge(config)
     unless @config[:no_run]
       @files = get_files
+      raise "no exported tables found in #{@config[:data_dir]}" if @files.empty?
       @indexes = get_indexes
       @keys = get_keys
       @sequences = get_sequences

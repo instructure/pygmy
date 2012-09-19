@@ -52,6 +52,9 @@ Notes:
 
 Known Limitations:
 
+  * pygmy depends on psql, sed and awk. it has only been tested on Ubuntu,
+    and is known not to work correctly on the Mac (due to differences in
+    sed's behavior)
   * pygmy sets the lastval for each sequence to the maximum column value
     of any column(s) using it, which is probably (but not necessarily) the
     last auto-increment value in mysql

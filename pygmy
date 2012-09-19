@@ -36,6 +36,7 @@
 #   -h, --help               show this help, then exit
 #
 # Notes:
+#
 #   you must use the --tab option when dumping your mysql database, and you
 #   must not use any of the --fields-xxx or --lines-terminated-by options to
 #   change the formatting.
@@ -49,6 +50,9 @@
 #   set up the schema.
 #
 # Known Limitations:
+#   * pygmy depends on psql, sed and awk. it has only been tested on Ubuntu,
+#     and is known not to work correctly on the Mac (due to differences in
+#     sed's behavior) 
 #   * pygmy sets the lastval for each sequence to the maximum column value
 #     of any column(s) using it, which is probably (but not necessarily) the
 #     last auto-increment value in mysql
@@ -74,6 +78,7 @@
 
 class Pygmy
   def initialize(psql_args, config)
+    check_dependencies
     @psql_args = psql_args
     @config = {:schema => 'public'}.merge(config)
     unless @config[:no_run]
@@ -83,6 +88,12 @@ class Pygmy
       @keys = get_keys
       @sequences = get_sequences
     end
+  end
+
+  def check_dependencies
+    raise "missing dependency `psql`" unless `which psql`.size > 1
+    raise "missing dependency `sed`" unless `which sed`.size > 1
+    raise "missing dependency `awk`" unless `which awk`.size > 1
   end
 
   def run

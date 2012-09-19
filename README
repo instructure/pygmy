@@ -1,0 +1,63 @@
+pygmy quickly imports mysql tab data dumps into a postgres database.
+
+psql does all the heavy lifting, pygmy just tells it what to do (drop
+keys and indexes, COPY data, recreate indexes and keys, run ANALYZE,
+populate sequences).
+
+Usage:
+
+  pygmy [OPTION]... [-- [PSQL_OPTION]... [DBNAME [USERNAME]]]
+
+Example:
+
+  mysqldump mydb -u myuser --tab=./ --no-create-info
+  pygmy -- pgdb pguser
+
+Options:
+
+  -d, --data-dir=DIR       directory containing tab-delimited dump files
+                           (default: ".")
+      --dry-run            outputs the psql import commands rather than
+                           running them
+      --export             export each table from the pg database. will
+                           overwrite previous export files
+      --verify             confirm each exported table is identical to the
+                           source data. does implicit --export of any tables
+                           not already exported
+      --no-import          useful in conjunction with --verify if the data
+                           was imported previously. otherwise this behaves
+                           similarly to --dry-run
+      --diff-threshold=N   used in conjunction with --verify. files larger
+                           than N MB will be cksum'ed rather than diffed to
+                           determine if they are different. default 100 MB
+      --schema=SCHEMA      database schema (default: "public")
+  -o, --only=T1,T2...      only import the specified tables
+  -s, --skip=T1,T2...      skip the specified tables
+  -v, --verbose            verbose mode
+  -h, --help               show this help, then exit
+
+Notes:
+
+  you must use the --tab option when dumping your mysql database, and you
+  must not use any of the --fields-xxx or --lines-terminated-by options to
+  change the formatting.
+
+  PSQL_OPTIONS, DBNAME and USERNAME are passed along to psql. refer to its
+  documentation for more info.
+
+  pygmy only imports data, it does not set up the schema. it's built with
+  rails apps in mind (though it may be useful for my->pg migrations in
+  general). ideally you would do something like `rake db:migrate` prior to
+  set up the schema.
+
+Known Limitations:
+
+  * pygmy sets the lastval for each sequence to the maximum column value
+    of any column(s) using it, which is probably (but not necessarily) the
+    last auto-increment value in mysql
+  * tables exported from postgres for verification should probably not be
+    imported into your mysql db, since some data may be changed. anything
+    looking like a bool (t or f) gets converted to a tinyint to elminate
+    false positives during our diff (we do the same thing on the mysql
+    side), and that includes varchar/text columns
+

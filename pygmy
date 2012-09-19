@@ -1,0 +1,454 @@
+#!/usr/bin/env ruby
+
+# pygmy quickly imports mysql tab data dumps into a postgres database.
+#
+# psql does all the heavy lifting, pygmy just tells it what to do (drop keys
+# and indexes, COPY data, recreate indexes and keys, run ANALYZE, populate
+# sequences).
+#
+# Usage:
+#   pygmy [OPTION]... [-- [PSQL_OPTION]... [DBNAME [USERNAME]]]
+#
+# Example:
+#   mysqldump mydb -u myuser --tab=./ --no-create-info
+#   pygmy -- pgdb pguser
+#
+# Options:
+#   -d, --data-dir=DIR       directory containing tab-delimited dump files
+#                            (default: ".")
+#       --dry-run            outputs the psql import commands rather than
+#                            running them
+#       --export             export each table from the pg database. will
+#                            overwrite previous export files
+#       --verify             confirm each exported table is identical to the
+#                            source data. does implicit --export of any tables
+#                            not already exported
+#       --no-import          useful in conjunction with --verify if the data
+#                            was imported previously. otherwise this behaves
+#                            similarly to --dry-run
+#       --diff-threshold=N   used in conjunction with --verify. files larger
+#                            than N MB will be cksum'ed rather than diffed to
+#                            determine if they are different. default 100 MB
+#       --schema=SCHEMA      database schema (default: "public")
+#   -o, --only=T1,T2...      only import the specified tables
+#   -s, --skip=T1,T2...      skip the specified tables
+#   -v, --verbose            verbose mode
+#   -h, --help               show this help, then exit
+#
+# Notes:
+#   you must use the --tab option when dumping your mysql database, and you
+#   must not use any of the --fields-xxx or --lines-terminated-by options to
+#   change the formatting.
+#
+#   PSQL_OPTIONS, DBNAME and USERNAME are passed along to psql. refer to its
+#   documentation for more info.
+#
+#   pygmy only imports data, it does not set up the schema. it's built with
+#   rails apps in mind (though it may be useful for my->pg migrations in
+#   general). ideally you would do something like `rake db:migrate` prior to
+#   set up the schema.
+#
+# Known Limitations:
+#   * pygmy sets the lastval for each sequence to the maximum column value
+#     of any column(s) using it, which is probably (but not necessarily) the
+#     last auto-increment value in mysql
+#   * tables exported from postgres for verification should probably not be
+#     imported into your mysql db, since some data may be changed. anything
+#     looking like a bool (t or f) gets converted to a tinyint to elminate
+#     false positives during our diff (we do the same thing on the mysql
+#     side), and that includes varchar/text columns
+
+
+# misc notes...
+#
+# http://www.postgresql.org/docs/9.0/static/populate.html
+#
+# some pygmy prerequisites for better speed:
+#  * increase maintenance_work_mem
+#  * increase checkpoint_segments
+#  * disable WAL archival and streaming replication
+#
+# do we want to make this even faster by having pygmy also do the mysqldump
+# (or something similar). the ideal scenario would be to pipe the data from
+# mysql right into postgres, maybe using some SELECT INTO OUTFILE voodoo
+
+class Pygmy
+  def initialize(psql_args, config)
+    @psql_args = psql_args
+    @config = {:schema => 'public'}.merge(config)
+    unless @config[:no_run]
+      @files = get_files
+      @indexes = get_indexes
+      @keys = get_keys
+      @sequences = get_sequences
+    end
+  end
+
+  def run
+    return unless @files
+    unless @config[:no_import]
+      drop_keys
+      @files.each do |table_name, filename|
+        import_table(table_name, filename)
+      end
+      create_keys
+
+      update_sequences
+    end
+    if @config[:verify] || @config[:export]
+      @files.each do |table_name, filename|
+        out_filename = filename.sub(/txt\z/, 'txt.postgres')
+        export_table(table_name, out_filename) if @config[:export] || !File.exist?(out_filename)
+        verify_files(table_name, filename, out_filename) if @config[:verify]
+      end
+    end
+  end
+
+  # all indexes (includes primary key indexes)
+  def get_indexes
+    table_cond = @files ? "AND r.relname IN (#{@files.map{|(t,f)|"'#{t}'"}.join(', ')})" : ''
+    results = query(<<-SQL)
+      SELECT
+        r.relname,
+        i.relname,
+        ri.indisprimary,
+        pg_get_indexdef(i.oid)
+      FROM
+        pg_class r,
+        pg_class i,
+        pg_index ri
+      WHERE
+        ri.indexrelid = i.oid
+        AND ri.indrelid = r.oid
+        AND r.relkind = 'r'
+        AND i.relkind = 'i'
+        AND r.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = '#{@config[:schema]}')
+        #{table_cond}
+    SQL
+
+    hash = Hash.new(){|hash, key| hash.store(key, [])}
+    results.each do |row|
+      table, index, primary_key, create_sql = row.split(/\t/)
+      hash[table] << {:index => index, :primary_key => primary_key == 't', :create_sql => create_sql}
+    end
+    hash
+  end
+
+  # foreign and primary key constraints
+  def get_keys
+    table_cond = @files ? "AND r.relname IN (#{@files.map{|(t,f)|"'#{t}'"}.join(', ')})" : ''
+    results = query(<<-SQL)
+      SELECT
+        r.relname,
+        c.conname,
+        c.contype,
+        pg_get_constraintdef(c.oid)
+      FROM
+        pg_class r,
+        pg_constraint c
+      WHERE
+        c.conrelid = r.oid
+        AND c.contype IN ('f', 'p')
+        AND r.relkind = 'r'
+        AND r.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = '#{@config[:schema]}')
+        #{table_cond}
+    SQL
+
+    hash = {}
+    results.map do |row|
+      table, key, type, create_sql = row.split(/\t/)
+      hash[key] = {:table => table, :type => type == 'p' ? :primary_key : :foreign_key, :create_sql => create_sql}
+    end
+    hash
+  end
+
+  def get_sequences
+    table_cond = @files ? "AND r.relname IN (#{@files.map{|(t,f)|"'#{t}'"}.join(', ')})" : ''
+    results = query(<<-SQL)
+      SELECT
+        s.relname,
+        (SELECT relname FROM pg_class WHERE oid = attrelid),
+        a.attname
+      FROM
+        pg_class s,
+        pg_class r,
+        pg_attrdef ad,
+        pg_attribute a
+      WHERE
+        ad.adsrc = 'nextval(''' || s.relname || '''::regclass)'
+        AND ad.adnum = a.attnum
+        AND ad.adrelid = a.attrelid
+        AND s.relkind = 'S'
+        AND s.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = '#{@config[:schema]}')
+        AND a.attrelid = r.oid
+        #{table_cond}
+    SQL
+
+    hash = {}
+    results.map{ |row|
+      seq, table, col = row.split(/\t/)
+      hash[seq] ||= []
+      hash[seq] << [table, col]
+    }
+    hash
+  end
+
+  def get_booleans
+    table_cond = @files ? "AND r.relname IN (#{@files.map{|(t,f)|"'#{t}'"}.join(', ')})" : ''
+    results = query(<<-SQL)
+      SELECT
+        r.relname,
+        a.attname
+      FROM
+        pg_attribute a,
+        pg_class r
+      WHERE
+        attrelid = r.oid
+        AND attnum > 0
+        AND atttypid = (SELECT pg_type.oid FROM pg_type, pg_namespace WHERE typname = 'bool' AND typnamespace = pg_namespace.oid AND nspname = 'pg_catalog')
+        AND relkind = 'r'
+        AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = '#{@config[:schema]}')
+        #{table_cond}
+      ORDER BY
+        r.relname,
+        a.attname
+    SQL
+
+    results.map{ |row| row.split(/\t/) }
+  end
+
+  def get_varchars
+    table_cond = @files ? "AND r.relname IN (#{@files.map{|(t,f)|"'#{t}'"}.join(', ')})" : ''
+    results = query(<<-SQL)
+      SELECT
+        r.relname,
+        a.attname,
+        a.atttypmod - CASE WHEN a.atttypmod < 128 THEN 1 ELSE 4 END
+      FROM
+        pg_attribute a,
+        pg_class r
+      WHERE
+        attrelid = r.oid
+        AND attnum > 0
+        AND atttypid = (SELECT pg_type.oid FROM pg_type, pg_namespace WHERE typname = 'varchar' AND typnamespace = pg_namespace.oid AND nspname = 'pg_catalog')
+        AND atttypmod <> -1
+        AND relkind = 'r'
+        AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = '#{@config[:schema]}')
+        #{table_cond}
+      ORDER BY
+        r.relname,
+        a.attname
+    SQL
+
+    results.map{ |row| row.split(/\t/) }
+  end
+
+  def get_files
+    Dir["#{@config[:data_dir]}/*.txt"].sort.select{ |filename|
+      File.size?(filename)
+    }.map{ |filename|
+      table_name = filename.sub(/.*\/(.*).txt/, '\\1')
+      [table_name, filename]
+    }.select { |(table_name, filename)|
+      (@config[:skip].nil? || !@config[:skip].include?(table_name)) &&
+      (@config[:only].nil? || @config[:only].include?(table_name))
+    }
+  end
+
+  def drop_keys
+    # postgres automatically drops the primary key index when you drop the constraint... so we skip
+    # that in the index dropping fu later
+    puts "dropping keys" if @config[:verbose]
+    execute(@keys.to_a.map{ |(key, data)| "ALTER TABLE #{data[:table]} DROP CONSTRAINT #{key};" }.join("\n"))
+    puts "ok" if @config[:verbose]
+  end
+
+  def create_keys
+    # primary key recreation is handled in the index fu, so we skip it here
+    puts "recreating keys" if @config[:verbose]
+    execute(@keys.to_a.reject{ |(key, data)| data[:type] == :primary_key}.map{ |(key, data)| "ALTER TABLE #{data[:table]} ADD CONSTRAINT #{key} #{data[:create_sql]};" }.join("\n"))
+    puts "ok" if @config[:verbose]
+  end
+
+  def import_table(table_name, filename)
+    puts "importing #{table_name}" if @config[:verbose]
+    drop_index_sql = @indexes[table_name].reject{ |index| index[:primary_key] }.map{ |index| "DROP INDEX #{index[:index]};" }.join("\n")
+    create_index_sql = @indexes[table_name].map{ |index| index[:primary_key] ? "ALTER TABLE #{table_name} ADD CONSTRAINT #{index[:index]} #{@keys[index[:index]][:create_sql]};" : index[:create_sql] + ";" }.join("\n")
+
+    sql = <<-SQL
+      BEGIN;
+      ALTER TABLE #{table_name} DISABLE TRIGGER ALL;
+      #{drop_index_sql}
+      TRUNCATE #{table_name};
+      COPY #{table_name} FROM STDIN;
+      #{create_index_sql}
+      ANALYZE #{table_name};
+      ALTER TABLE #{table_name} ENABLE TRIGGER ALL;
+      COMMIT;
+    SQL
+
+    command = <<-COMMAND
+      awk '{ if ($0 ~ /(^|[^\\\\])(\\\\\\\\)*\\\\$/) { sub(/\\\\$/, ""); printf "%s\\\\n", $0 } else { print $0} }' #{filename} | \
+      sed -E 's/\\r/\\\\r/g; s/(^|\\t)0000-00-00( 00:00:00)?/\\1\\\\N/g' | \
+      psql #{@psql_args} -c #{sql.gsub(/\s+/, ' ').strip.inspect} 2>&1
+    COMMAND
+
+    if @config[:dry_run]
+      puts command
+    else
+      result = `#{command}`
+      $stderr.puts "error importing #{table_name}:\n#{result}" if $?.exitstatus != 0
+    end
+  end
+
+  def update_sequences
+    puts "updating sequences" if @config[:verbose]
+    execute(@sequences.to_a.map{ |seq, columns |
+      # it's rare, but you could have multiple columns that use the same sequence for their default
+      # values... so we handle that case
+      "SELECT setval('#{seq}', (SELECT MAX(v) FROM (" +
+        columns.map{ |(table, col)| "SELECT MAX(\"#{col}\") AS v FROM #{table}" }.join(" UNION ") +
+      ") t));"
+    }.join("\n"))
+    puts "ok" if @config[:verbose]
+  end
+
+  def export_table(table_name, filename)
+    puts "exporting #{table_name}" if @config[:verbose]
+    command = <<-COMMAND
+      psql #{@psql_args} -c 'COPY (SELECT * FROM #{table_name}) TO STDOUT;' | \
+      #{File.dirname(__FILE__)}/pg2myformat > #{filename} 2>&1
+    COMMAND
+    if @config[:dry_run]
+      puts command
+    else
+      result = `#{command}`
+      $stderr.puts "error exporting #{table_name}:\n#{result}" if $?.exitstatus != 0
+    end
+    puts "ok" if @config[:verbose]
+  end
+
+  def verify_files(table_name, mysql_filename, postgres_filename)
+    puts "verifying #{table_name}" if @config[:verbose]
+    mysql_cleanup_command = <<-COMMAND
+      sed -E 's/(^|\\t)0000-00-00( 00:00:00)?/\\1\\\\N/g; \
+              s/(\\t|^)t(\\t|$)/\\11\\2/g; s/(\\t|^)f(\\t|$)/\\10\\2/g; \
+              s/(\\t|^)t(\\t|$)/\\11\\2/g; s/(\\t|^)f(\\t|$)/\\10\\2/g' \
+      #{mysql_filename}
+    COMMAND
+    large_files = [File.size(mysql_filename), File.exist?(postgres_filename) ? File.size(postgres_filename) : 0].max > @config[:diff_threshold] * 1024**2
+    command = large_files ?
+      "#{mysql_cleanup_command.strip} | cksum; cksum #{postgres_filename}" :
+      "#{mysql_cleanup_command.strip} | diff - #{postgres_filename}"
+    if @config[:dry_run]
+      puts command
+    else
+      result = ""
+      IO.popen(command, "r") do |f|
+        10.times do
+          break if f.eof?
+          result << f.gets
+        end
+        if large_files
+          unless result.split("\n").map{|r|r.sub(" #{postgres_filename}", "")}.uniq.size == 1
+            $stderr.puts "#{table_name} verification failed. checksum mismatch:\n" + result
+            return
+          end
+        else
+          unless result.empty?
+            $stderr.puts "#{table_name} verification failed. sample differences:\n" + result
+            return
+          end
+        end
+      end
+    end
+    puts "ok" if @config[:verbose]
+  end
+
+  def query(sql)
+    execute "COPY (#{sql}) TO STDOUT", true
+  end
+
+  def execute(sql, ignore_dry_run = false)
+    return if sql.empty?
+    command = "psql #{@psql_args} -c #{sql.gsub(/--.*/, '').gsub(/\s+/, ' ').strip.inspect} 2>&1"
+    if @config[:dry_run] && !ignore_dry_run
+      puts command
+    else
+      result = `#{command}`
+      raise "psql error:\n#{result}" if $?.exitstatus != 0
+      result.split("\n")
+    end
+  end
+end
+
+if __FILE__ == $0
+  require 'rubygems'
+  require 'rdoc/usage'
+  require 'getoptlong'
+
+  $stdout.sync = true
+  $stderr.sync = true
+
+  config = {
+    :data_dir => "./",
+    :dry_run => false,
+    :export => false,
+    :verify => false,
+    :no_import => false,
+    :verbose => false,
+    :diff_threshold => 100
+  }
+
+  opts = GetoptLong.new(
+    ['--help',        '-h', GetoptLong::NO_ARGUMENT],
+    ['--data-dir',    '-d', GetoptLong::REQUIRED_ARGUMENT],
+    ['--only',        '-o', GetoptLong::REQUIRED_ARGUMENT],
+    ['--skip',        '-s', GetoptLong::REQUIRED_ARGUMENT],
+    ['--dry-run',           GetoptLong::NO_ARGUMENT],
+    ['--export',            GetoptLong::NO_ARGUMENT],
+    ['--verify',            GetoptLong::NO_ARGUMENT],
+    ['--no-import',         GetoptLong::NO_ARGUMENT],
+    ['--diff-threshold',    GetoptLong::REQUIRED_ARGUMENT],
+    ['--verbose',     '-v', GetoptLong::NO_ARGUMENT],
+    ['--schema',            GetoptLong::REQUIRED_ARGUMENT]
+  )
+
+  opts.each do |opt, arg|
+    case opt
+      when '--help'
+        RDoc::usage
+      when '--data-dir'
+        config[:data_dir] = arg
+      when '--skip'
+        config[:skip] = arg.split(',')
+      when '--only'
+        config[:only] = arg.split(',')
+      when '--dry-run'
+        config[:dry_run] = true
+      when '--export'
+        config[:export] = true
+      when '--verify'
+        config[:verify] = true
+      when '--no-import'
+        config[:no_import] = true
+      when '--diff-threshold'
+        config[:diff_threshold] = arg.to_i
+      when '--verbose'
+        config[:verbose] = true
+      when '--schema'
+        config[:schema] = arg
+    end
+  end
+
+  begin
+    raise opts.error_message if opts.error_message
+    psql_args = ARGV.map(&:inspect).join(" ")
+
+    Pygmy.new(psql_args, config).run
+  rescue
+    $stderr.puts "pygmy: #{$!}"
+    $stderr.puts "pygmy: Try `pygmy --help' for more information."
+    exit 1
+  end
+end

@@ -1,0 +1,13 @@
+#!/usr/bin/env ruby
+
+# lets us do just one pass of each line, greatly simplifying the regex fu.
+# performs a bit faster than the dozen or so sed replacements I ended up
+# needing. this would be even more hawt in ruby 1.9 (gsub w/ hash of
+# replacements)
+hash = {"r" => "\r", "b" => "\b", "v" => "\v", "f" => "\f", "n" => "\\\n", "t" => "\\\t", "\\" => "\\\\"}
+begin
+  while line = gets
+    puts (line.gsub(/\\([rbvfnt\\])/){ hash[$1] }.gsub(/(^|\t)([tf])(?=($|\t))/){ "#{$1}#{$2 == "t" ? 1 : 0}" })
+  end
+rescue Errno::EPIPE
+end
